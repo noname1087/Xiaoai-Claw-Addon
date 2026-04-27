@@ -1,6 +1,10 @@
 name: Bundle / Release
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
   workflow_dispatch:
     inputs:
       create_release:
@@ -420,7 +424,7 @@ jobs:
 
   create-release:
     runs-on: ubuntu-latest
-    if: ${{ inputs.create_release }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release }}
     needs:
       - smoke-test-bundle-linux
       - smoke-test-bundle-windows
