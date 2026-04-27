@@ -53,6 +53,7 @@ jobs:
           sh uninstall.sh --help >/dev/null
           node scripts/configure-openclaw-install.mjs --help >/dev/null
           node scripts/configure-openclaw-uninstall.mjs --help >/dev/null
+          node --check scripts/xiaomi-login-cli.mjs
           node --check scripts/probe-xiaomi-status.mjs
 
   verify-windows:
@@ -84,6 +85,7 @@ jobs:
           call uninstall.cmd --help >NUL
           node scripts\configure-openclaw-install.mjs --help >NUL
           node scripts\configure-openclaw-uninstall.mjs --help >NUL
+          node --check scripts\xiaomi-login-cli.mjs
 
   bundle:
     runs-on: ubuntu-latest
@@ -135,6 +137,7 @@ jobs:
           test -f "$bundle_root/install.cmd"
           test -f "$bundle_root/uninstall.sh"
           test -f "$bundle_root/uninstall.cmd"
+          test -f "$bundle_root/scripts/xiaomi-login-cli.mjs"
           test -f "$bundle_root/scripts/publish-clawhub-package.mjs"
           test ! -e "$bundle_root/PROJECT_ANALYSIS.md"
           test ! -e "$bundle_root/CROSS_CLAW_ADAPTATION_PLAN.md"
@@ -221,6 +224,7 @@ jobs:
           test -f "$root/assets/fonts/noto-sans-sc/wght.css"
           test -f "$root/scripts/configure-openclaw-install.mjs"
           test -f "$root/scripts/configure-openclaw-uninstall.mjs"
+          test -f "$root/scripts/xiaomi-login-cli.mjs"
           test -f "$root/scripts/publish-clawhub-package.mjs"
           test -f "$root/scripts/probe-xiaomi-status.mjs"
           test ! -e "$root/openclaw-plugin-xiaoai-cloud/package.json"
@@ -268,6 +272,7 @@ jobs:
           sh "$root/uninstall.sh" --help >/dev/null
           node "$root/scripts/configure-openclaw-install.mjs" --help >/dev/null
           node "$root/scripts/configure-openclaw-uninstall.mjs" --help >/dev/null
+          node --check "$root/scripts/xiaomi-login-cli.mjs"
           node --check "$root/scripts/publish-clawhub-package.mjs"
           node --check "$root/scripts/probe-xiaomi-status.mjs"
 
@@ -331,6 +336,7 @@ jobs:
             "$root\assets\fonts\noto-sans-sc\wght.css",
             "$root\scripts\configure-openclaw-install.mjs",
             "$root\scripts\configure-openclaw-uninstall.mjs",
+            "$root\scripts\xiaomi-login-cli.mjs",
             "$root\scripts\publish-clawhub-package.mjs",
             "$root\scripts\probe-xiaomi-status.mjs"
           ) | ForEach-Object {
@@ -368,6 +374,9 @@ jobs:
 
           node "$root\scripts\configure-openclaw-uninstall.mjs" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "configure-openclaw-uninstall.mjs --help failed with exit code $LASTEXITCODE" }
+
+          node --check "$root\scripts\xiaomi-login-cli.mjs" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "xiaomi-login-cli.mjs --check failed with exit code $LASTEXITCODE" }
 
           node --check "$root\scripts\publish-clawhub-package.mjs" | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "publish-clawhub-package.mjs --check failed with exit code $LASTEXITCODE" }
