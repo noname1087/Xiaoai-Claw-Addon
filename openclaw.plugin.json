@@ -3,6 +3,31 @@
   "name": "Xiaoai Speaker Cloud Plugin",
   "description": "OpenClaw 直连小米账号/米家云的小爱音箱语音播报与唤醒拦截插件。",
   "version": "1.0.0",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "xiaoai_speak",
+      "xiaoai_play_audio",
+      "xiaoai_tts_bridge",
+      "xiaoai_set_volume",
+      "xiaoai_set_playback_mute",
+      "xiaoai_get_volume",
+      "xiaoai_new_session",
+      "xiaoai_wake_up",
+      "xiaoai_execute",
+      "xiaoai_set_mode",
+      "xiaoai_set_wake_word",
+      "xiaoai_get_status",
+      "xiaoai_login_begin",
+      "xiaoai_login_status",
+      "xiaoai_console_open",
+      "xiaoai_run_calibration",
+      "xiaoai_set_dialog_window",
+      "xiaoai_update_settings"
+    ]
+  },
   "uiHints": {
     "password": {
       "label": "Xiaomi Password",

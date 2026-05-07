@@ -16,6 +16,7 @@ const REQUIRED_XIAOAI_TOOLS = [
     "xiaoai_play_audio",
     "xiaoai_tts_bridge",
     "xiaoai_set_volume",
+    "xiaoai_set_playback_mute",
     "xiaoai_get_volume",
     "xiaoai_new_session",
     "xiaoai_wake_up",
@@ -26,6 +27,7 @@ const REQUIRED_XIAOAI_TOOLS = [
     "xiaoai_login_begin",
     "xiaoai_login_status",
     "xiaoai_console_open",
+    "xiaoai_run_calibration",
     "xiaoai_set_dialog_window",
     "xiaoai_update_settings",
 ];

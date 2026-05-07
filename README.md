@@ -320,12 +320,14 @@ npm run login:cli -- login --send-code
   传 `url` 即可；既支持 `http/https` 音频链接，也支持 OpenClaw 机器上的本地绝对路径（含 `file://`）。
 - `xiaoai_execute`
 - `xiaoai_set_volume`
+- `xiaoai_set_playback_mute`
 - `xiaoai_get_volume`
 - `xiaoai_wake_up`
 - `xiaoai_set_mode`
 - `xiaoai_set_wake_word`
 - `xiaoai_set_dialog_window`
 - `xiaoai_update_settings`
+- `xiaoai_run_calibration`
 - `xiaoai_new_session`
 - `xiaoai_get_status`
 
