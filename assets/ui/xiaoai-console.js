@@ -260,8 +260,10 @@ function initAccessPage() {
 
 function initConsolePage() {
   const locationUrl = new URL(window.location.href);
+  const hashParams = new URLSearchParams(locationUrl.hash.replace(/^#/, ""));
   const consoleAccessToken =
     locationUrl.searchParams.get("access_token") ||
+    hashParams.get("access_token") ||
     readPersistedConsoleAccessToken() ||
     "";
 

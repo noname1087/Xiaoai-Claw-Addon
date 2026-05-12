@@ -117,8 +117,15 @@ export interface PersistedSpeakerMuteState {
     updatedAt?: string;
 }
 
+export interface PersistedConsoleAccessGrant {
+    codeHash: string;
+    createdAt?: string;
+    expiresAt: string;
+}
+
 export interface PersistedConsoleState {
     accessToken?: string;
+    accessGrants?: PersistedConsoleAccessGrant[];
     events?: ConsoleEventEntry[];
     audioPlaybackClearedAt?: string;
     speakerMuteStates?: Record<string, PersistedSpeakerMuteState>;
@@ -173,6 +180,27 @@ export async function loadPersistedConsoleState(
                 typeof parsed.accessToken === "string" && parsed.accessToken.trim()
                     ? parsed.accessToken.trim()
                     : undefined,
+            accessGrants: Array.isArray(parsed.accessGrants)
+                ? parsed.accessGrants
+                    .map((item) => {
+                        const grant = item as PersistedConsoleAccessGrant;
+                        const codeHash =
+                            typeof grant?.codeHash === "string" ? grant.codeHash.trim() : "";
+                        const expiresAt =
+                            typeof grant?.expiresAt === "string" ? grant.expiresAt.trim() : "";
+                        if (!codeHash || !expiresAt) {
+                            return undefined;
+                        }
+                        return {
+                            codeHash,
+                            ...(typeof grant?.createdAt === "string" && grant.createdAt.trim()
+                                ? { createdAt: grant.createdAt.trim() }
+                                : {}),
+                            expiresAt,
+                        } satisfies PersistedConsoleAccessGrant;
+                    })
+                    .filter((item): item is PersistedConsoleAccessGrant => Boolean(item))
+                : [],
             events: Array.isArray(parsed.events)
                 ? parsed.events
                     .filter((item) => item && typeof item === "object")
@@ -264,6 +292,26 @@ export async function savePersistedConsoleState(
     const events = Array.isArray(state.events) ? state.events.slice(-300) : [];
     const next = {
         accessToken: state.accessToken,
+        accessGrants: Array.isArray(state.accessGrants)
+            ? state.accessGrants
+                .map((grant) => {
+                    const codeHash =
+                        typeof grant?.codeHash === "string" ? grant.codeHash.trim() : "";
+                    const expiresAt =
+                        typeof grant?.expiresAt === "string" ? grant.expiresAt.trim() : "";
+                    if (!codeHash || !expiresAt) {
+                        return undefined;
+                    }
+                    return {
+                        codeHash,
+                        ...(typeof grant?.createdAt === "string" && grant.createdAt.trim()
+                            ? { createdAt: grant.createdAt.trim() }
+                            : {}),
+                        expiresAt,
+                    } satisfies PersistedConsoleAccessGrant;
+                })
+                .filter((item): item is PersistedConsoleAccessGrant => Boolean(item))
+            : [],
         events,
         audioPlaybackClearedAt:
             typeof state.audioPlaybackClearedAt === "string" &&

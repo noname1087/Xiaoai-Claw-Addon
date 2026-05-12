@@ -1123,13 +1123,14 @@ export class LoginPortal {
 
     async handleHttpRoute(
         request: IncomingMessage,
-        response: ServerResponse
+        response: ServerResponse,
+        pathnameOverride?: string
     ): Promise<boolean> {
         const requestUrl = new URL(
             request.url || "/",
             `http://${request.headers.host || "localhost"}`
         );
-        const matchedPath = this.matchPathname(requestUrl.pathname);
+        const matchedPath = pathnameOverride || this.matchPathname(requestUrl.pathname);
         if (!matchedPath) {
             return false;
         }

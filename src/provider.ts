@@ -26,6 +26,7 @@ import {
 } from "./auth-portal.js";
 import {
     ConsoleEventEntry,
+    PersistedConsoleAccessGrant,
     PersistedAudioCalibrationSummary,
     PersistedConversationInterceptCalibrationSummary,
     PersistedConversationInterceptLatencyProfile,
@@ -560,6 +561,7 @@ const DEFAULT_TRANSITION_PHRASES = ["让我想想", "嗯，稍等一下", "好�
 const DEFAULT_WAKE_WORD_PATTERN = "小[虾瞎侠下夏霞]";
 const DEFAULT_DIALOG_WINDOW_SECONDS = 30;
 const DEFAULT_AUTH_PORT = 17890;
+const DEFAULT_AUTH_ROUTE_PATH = "/api/xiaoai-cloud";
 const DEFAULT_DEBUG_LOG_ENABLED = true;
 const DEFAULT_VOICE_CONTEXT_MAX_TURNS = 6;
 const DEFAULT_VOICE_CONTEXT_MAX_CHARS = 1400;
@@ -655,6 +657,8 @@ const CONSOLE_COOKIE_NAME = "xiaoai_console_token";
 const CONSOLE_EVENT_LIMIT = 300;
 const CONSOLE_FETCH_LIMIT = 50;
 const CONSOLE_JSON_BODY_LIMIT_BYTES = 64 * 1024;
+const CONSOLE_ACCESS_GRANT_TTL_MS = 10 * 60 * 1000;
+const CONSOLE_ACCESS_GRANT_LIMIT = 12;
 const HELPER_STATUS_CACHE_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 320;
 const MIN_POLL_INTERVAL_MS = 200;
@@ -2216,6 +2220,16 @@ function normalizeHttpPath(value: string | undefined, fallback: string) {
     return withLeadingSlash.replace(/\/+$/, "") || fallback;
 }
 
+function resolveStaticAuthRoutePath() {
+    return normalizeHttpPath(
+        pickFirstString(
+            process.env.XIAOAI_CLOUD_AUTH_ROUTE_PATH,
+            DEFAULT_AUTH_ROUTE_PATH
+        ),
+        DEFAULT_AUTH_ROUTE_PATH
+    );
+}
+
 function normalizeBaseUrl(value: string | undefined) {
     if (!value) {
         return undefined;
@@ -2699,9 +2713,9 @@ async function resolvePluginConfig(
             pickFirstString(
                 apiConfig.authRoutePath,
                 env.XIAOAI_CLOUD_AUTH_ROUTE_PATH,
-                "/api/xiaoai-cloud"
+                DEFAULT_AUTH_ROUTE_PATH
             ),
-            "/api/xiaoai-cloud"
+            DEFAULT_AUTH_ROUTE_PATH
         ),
         publicBaseUrl: pickFirstString(
             apiConfig.publicBaseUrl,
@@ -2759,13 +2773,14 @@ class XiaoaiCloudPlugin {
     private toolsRegistered = false;
     private serviceStateDir?: string;
     private loginPortal?: LoginPortal;
-    private loginRouteRegisteredPath?: string;
+    private readonly registeredGatewayRoutePaths = new Set<string>();
     private loginSessionId?: string;
     private loginNotificationSessionId?: string;
     private observedGatewayAuthBaseUrls: string[] = [];
     private startServicePromise?: Promise<void>;
     private consoleState?: {
         accessToken?: string;
+        accessGrants?: PersistedConsoleAccessGrant[];
         events?: ConsoleEventEntry[];
         audioPlaybackClearedAt?: string;
         speakerMuteStates?: Record<string, PersistedSpeakerMuteState>;
@@ -2871,6 +2886,8 @@ class XiaoaiCloudPlugin {
         }
         this.toolsRegistered = true;
         this.registerPluginTools();
+        this.ensureGatewayRouteRegistered(resolveStaticAuthRoutePath());
+        void this.ensureGatewayRouteRegisteredFromCurrentConfig();
     }
 
     start() {
@@ -2885,14 +2902,7 @@ class XiaoaiCloudPlugin {
 
         this.startServicePromise = (async () => {
             this.registerTools();
-            try {
-                const config = await this.loadConfig(false);
-                this.ensureGatewayRouteRegistered(config);
-            } catch (error) {
-                console.error(
-                    `[XiaoAI Cloud] 控制台路由初始化失败: ${this.errorMessage(error)}`
-                );
-            }
+            await this.ensureGatewayRouteRegisteredFromCurrentConfig();
             this.ensureReady()
                 .then(() => this.startPolling())
                 .catch((error) => {
@@ -2953,7 +2963,6 @@ class XiaoaiCloudPlugin {
 
         this.loginSessionId = undefined;
         this.loginNotificationSessionId = undefined;
-        this.loginRouteRegisteredPath = undefined;
     }
 
     private errorMessage(error: unknown): string {
@@ -3941,6 +3950,9 @@ class XiaoaiCloudPlugin {
         const stored = await loadPersistedConsoleState(config.consoleStatePath);
         this.consoleState = {
             accessToken: stored.accessToken,
+            accessGrants: Array.isArray(stored.accessGrants)
+                ? stored.accessGrants.slice(-CONSOLE_ACCESS_GRANT_LIMIT)
+                : [],
             events: Array.isArray(stored.events)
                 ? stored.events.slice(-CONSOLE_EVENT_LIMIT)
                 : [],
@@ -3958,6 +3970,7 @@ class XiaoaiCloudPlugin {
     private async mutateConsoleState(
         mutator: (state: {
             accessToken?: string;
+            accessGrants?: PersistedConsoleAccessGrant[];
             events?: ConsoleEventEntry[];
             audioPlaybackClearedAt?: string;
             speakerMuteStates?: Record<string, PersistedSpeakerMuteState>;
@@ -3973,6 +3986,7 @@ class XiaoaiCloudPlugin {
             const config = await this.loadConfig(false);
             await savePersistedConsoleState(config.consoleStatePath, {
                 accessToken: state.accessToken,
+                accessGrants: state.accessGrants,
                 events: state.events,
                 audioPlaybackClearedAt: state.audioPlaybackClearedAt,
                 speakerMuteStates: state.speakerMuteStates,
@@ -4358,6 +4372,39 @@ class XiaoaiCloudPlugin {
         return token;
     }
 
+    private hashConsoleAccessGrantCode(code: string) {
+        return createHash("sha256").update(code).digest("hex");
+    }
+
+    private async createConsoleEntryUrl() {
+        const [baseUrl] = await this.computeConsoleBaseUrls();
+        const accessToken = await this.getConsoleAccessToken();
+        const code = randomBytes(10).toString("base64url");
+        const nowMs = Date.now();
+        const expiresAt = new Date(nowMs + CONSOLE_ACCESS_GRANT_TTL_MS).toISOString();
+        const codeHash = this.hashConsoleAccessGrantCode(code);
+
+        await this.mutateConsoleState((draft) => {
+            const activeGrants = (Array.isArray(draft.accessGrants)
+                ? draft.accessGrants
+                : []
+            ).filter((grant) => Date.parse(grant.expiresAt) > nowMs);
+            activeGrants.push({
+                codeHash,
+                createdAt: new Date(nowMs).toISOString(),
+                expiresAt,
+            });
+            draft.accessGrants = activeGrants.slice(-CONSOLE_ACCESS_GRANT_LIMIT);
+        });
+
+        const normalizedBase = baseUrl.replace(/\/+$/, "");
+        return {
+            url: `${normalizedBase}/console/open/${encodeURIComponent(code)}`,
+            fallbackUrl: `${normalizedBase}/console#access_token=${encodeURIComponent(accessToken)}`,
+            expiresAt,
+        };
+    }
+
     private async computeConsoleBaseUrls() {
         const config = await this.loadConfig(false);
         const explicitBases: string[] = [];
@@ -4643,9 +4690,7 @@ class XiaoaiCloudPlugin {
     }
 
     private async getConsoleEntryUrl() {
-        const [baseUrl] = await this.computeConsoleBaseUrls();
-        const accessToken = await this.getConsoleAccessToken();
-        return `${baseUrl.replace(/\/+$/, "")}/console?access_token=${encodeURIComponent(accessToken)}`;
+        return (await this.createConsoleEntryUrl()).url;
     }
 
     private extractConversationAnswerText(answer: any): string | undefined {
@@ -5886,7 +5931,7 @@ class XiaoaiCloudPlugin {
                 this.appendDebugTrace(event, details),
         });
         await portal.start();
-        this.ensureGatewayRouteRegistered(config);
+        this.ensureGatewayRouteRegistered(config.authRoutePath);
         this.loginPortal = portal;
         return portal;
     }
@@ -5917,10 +5962,15 @@ class XiaoaiCloudPlugin {
         );
     }
 
-    private setConsoleAccessCookie(response: any, request: any, config: PluginConfig) {
+    private setConsoleAccessCookie(
+        response: any,
+        request: any,
+        config: PluginConfig,
+        routePath = config.authRoutePath
+    ) {
         const parts = [
             `${CONSOLE_COOKIE_NAME}=${encodeURIComponent(this.consoleState?.accessToken || "")}`,
-            `Path=${config.authRoutePath}`,
+            `Path=${normalizeHttpPath(routePath, config.authRoutePath)}`,
             "HttpOnly",
             "SameSite=Lax",
             `Max-Age=${30 * 24 * 60 * 60}`,
@@ -6051,7 +6101,9 @@ class XiaoaiCloudPlugin {
                 ? request.headers["x-xiaoai-console-token"][0]
                 : request?.headers?.["x-xiaoai-console-token"]
         );
-        const queryToken = readString(requestUrl.searchParams.get("access_token") || undefined);
+        const queryToken =
+            readString(requestUrl.searchParams.get("access_token") || undefined) ||
+            readString(new URLSearchParams(requestUrl.hash.replace(/^#/, "")).get("access_token") || undefined);
         const cookies = parseCookies(
             Array.isArray(request?.headers?.cookie)
                 ? request.headers.cookie.join("; ")
@@ -6069,6 +6121,33 @@ class XiaoaiCloudPlugin {
                 safeTokenEquals(expected, queryToken) ||
                 safeTokenEquals(expected, cookieToken),
         };
+    }
+
+    private async verifyConsoleAccessGrant(code: string) {
+        const normalizedCode = readString(code);
+        if (!normalizedCode) {
+            return false;
+        }
+        const codeHash = this.hashConsoleAccessGrantCode(normalizedCode);
+        let matched = false;
+        const nowMs = Date.now();
+        await this.mutateConsoleState((draft) => {
+            const grants = Array.isArray(draft.accessGrants)
+                ? draft.accessGrants
+                : [];
+            draft.accessGrants = grants.filter((grant) => {
+                const expiresAtMs = Date.parse(grant.expiresAt);
+                const active = Number.isFinite(expiresAtMs) && expiresAtMs > nowMs;
+                if (!active) {
+                    return false;
+                }
+                if (!matched && safeTokenEquals(grant.codeHash, codeHash)) {
+                    matched = true;
+                }
+                return true;
+            });
+        }, { forceReload: true });
+        return matched;
     }
 
     private async handleConsoleApiRoute(
@@ -6950,7 +7029,8 @@ class XiaoaiCloudPlugin {
         request: any,
         response: any,
         requestUrl: URL,
-        matchedPath: string
+        matchedPath: string,
+        routePath = config.authRoutePath
     ) {
         if (matchedPath === "/audio-relay" || matchedPath.startsWith("/audio-relay/")) {
             return this.handleAudioRelayHttpRoute(request, response, matchedPath);
@@ -7007,13 +7087,33 @@ class XiaoaiCloudPlugin {
             return true;
         }
 
+        if (matchedPath.startsWith("/console/open/")) {
+            const rawCode = matchedPath.replace(/^\/console\/open\/?/, "");
+            const code = decodeURIComponentSafe(rawCode);
+            if (await this.verifyConsoleAccessGrant(code)) {
+                await this.getConsoleAccessToken();
+                this.setConsoleAccessCookie(response, request, config, routePath);
+                sendRedirect(response, `${routePath.replace(/\/+$/, "")}/console`);
+            } else {
+                sendHtml(
+                    response,
+                    renderConsoleAccessPage({
+                        assetBasePath: consoleAssetBasePath(routePath),
+                        hint: "控制台短链接已失效。请让 OpenClaw 重新生成控制台链接。",
+                    }),
+                    401
+                );
+            }
+            return true;
+        }
+
         if (matchedPath === "/" || matchedPath === "/console" || matchedPath === "/console/") {
             const auth = await this.resolveConsoleAuthorization(request, requestUrl);
             if (!auth.authorized) {
                 sendHtml(
                     response,
                     renderConsoleAccessPage({
-                        assetBasePath: consoleAssetBasePath(config.authRoutePath),
+                        assetBasePath: consoleAssetBasePath(routePath),
                         hint: auth.fromQuery
                             ? "访问口令无效。请重新使用插件生成的后台完整链接打开。"
                             : undefined,
@@ -7022,11 +7122,11 @@ class XiaoaiCloudPlugin {
                 return true;
             }
 
-            this.setConsoleAccessCookie(response, request, config);
+            this.setConsoleAccessCookie(response, request, config, routePath);
             sendHtml(
                 response,
                 renderConsolePage({
-                    assetBasePath: consoleAssetBasePath(config.authRoutePath),
+                    assetBasePath: consoleAssetBasePath(routePath),
                 })
             );
             return true;
@@ -7045,27 +7145,41 @@ class XiaoaiCloudPlugin {
         return false;
     }
 
-    private ensureGatewayRouteRegistered(config: PluginConfig) {
+    private async loadConfigForGatewayRoute(routePath: string) {
+        const config = await this.loadConfig(false);
+        const normalizedRoutePath = normalizeHttpPath(routePath, config.authRoutePath);
+        if (config.authRoutePath === normalizedRoutePath) {
+            return config;
+        }
+        return {
+            ...config,
+            authRoutePath: normalizedRoutePath,
+        };
+    }
+
+    private ensureGatewayRouteRegistered(routePath: string) {
         if (typeof this.api?.registerHttpRoute !== "function") {
             return;
         }
-        if (this.loginRouteRegisteredPath === config.authRoutePath) {
+        const normalizedRoutePath = normalizeHttpPath(routePath, DEFAULT_AUTH_ROUTE_PATH);
+        if (this.registeredGatewayRoutePaths.has(normalizedRoutePath)) {
             return;
         }
 
         this.api.registerHttpRoute({
-            path: config.authRoutePath,
+            path: normalizedRoutePath,
             auth: "plugin",
             match: "prefix",
             replaceExisting: true,
             handler: async (request: any, response: any) => {
                 try {
+                    const config = await this.loadConfigForGatewayRoute(normalizedRoutePath);
                     const requestUrl = new URL(
                         request.url || "/",
                         `http://${request.headers.host || "localhost"}`
                     );
                     const matchedPath = this.matchGatewayRoutePath(
-                        config.authRoutePath,
+                        normalizedRoutePath,
                         requestUrl.pathname
                     );
                     if (!matchedPath) {
@@ -7079,7 +7193,8 @@ class XiaoaiCloudPlugin {
                             request,
                             response,
                             requestUrl,
-                            matchedPath
+                            matchedPath,
+                            normalizedRoutePath
                         )
                     ) {
                         return true;
@@ -7087,7 +7202,7 @@ class XiaoaiCloudPlugin {
 
                     if (matchedPath.startsWith("/auth/")) {
                         const portal = await this.ensureLoginPortal();
-                        if (await portal.handleHttpRoute(request, response)) {
+                        if (await portal.handleHttpRoute(request, response, matchedPath)) {
                             return true;
                         }
                     }
@@ -7105,10 +7220,21 @@ class XiaoaiCloudPlugin {
                 }
             },
         });
-        this.loginRouteRegisteredPath = config.authRoutePath;
+        this.registeredGatewayRoutePaths.add(normalizedRoutePath);
         console.log(
-            `[XiaoAI Cloud] 已注册 Gateway 控制路由: ${config.authRoutePath}`
+            `[XiaoAI Cloud] 已注册 Gateway 控制路由: ${normalizedRoutePath}`
         );
+    }
+
+    private async ensureGatewayRouteRegisteredFromCurrentConfig() {
+        try {
+            const config = await this.loadConfig(false);
+            this.ensureGatewayRouteRegistered(config.authRoutePath);
+        } catch (error) {
+            console.error(
+                `[XiaoAI Cloud] 控制台路由初始化失败: ${this.errorMessage(error)}`
+            );
+        }
     }
 
     private buildLoginSeed(config: PluginConfig): LoginSessionSeed {
@@ -19796,14 +19922,16 @@ class XiaoaiCloudPlugin {
             description: "生成并转发小爱控制台后台链接，便于查看对话记录、事件流和直接向小爱发消息。",
             parameters: schemaObject({}),
             execute: async () => {
-                const consoleUrl = await this.getConsoleEntryUrl();
+                const consoleEntry = await this.createConsoleEntryUrl();
                 try {
                     await this.sendOpenclawNotification(
                         [
                             "这是小爱直连插件的后台控制台入口。",
-                            `控制台地址：${consoleUrl}`,
+                            `控制台短链接：${consoleEntry.url}`,
+                            `有效期：${consoleEntry.expiresAt}`,
                             "",
-                            "这个链接里自带后台访问口令，建议只发到自己的私聊，不要转发到群聊。",
+                            "短链接会在浏览器里自动完成配对，不再把 access_token 暴露在可见 URL 里。",
+                            "建议只发到自己的私聊，不要转发到群聊。",
                         ].join("\n"),
                         "控制台通知"
                     );
@@ -19815,7 +19943,10 @@ class XiaoaiCloudPlugin {
                 return {
                     content: [{
                         type: "text",
-                        text: `[SYSTEM]控制台链接已生成。${consoleUrl}`,
+                        text:
+                            `[SYSTEM]控制台短链接已生成并已尝试转发给用户。\n` +
+                            `控制台短链接：${consoleEntry.url}\n` +
+                            `有效期：${consoleEntry.expiresAt}`,
                     }],
                 };
             },
