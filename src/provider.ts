@@ -537,6 +537,12 @@ interface ConversationFetchLatencyProfile {
     updatedAtMs: number;
 }
 
+type ConversationFetchWinner = {
+    record: any | null;
+    source: "primary" | "hedge";
+    elapsedMs: number;
+};
+
 interface ConversationInterceptGuardPlan {
     aggressive: boolean;
     silenceMode: "pause" | "fast-stop";
@@ -732,9 +738,15 @@ const CONVERSATION_INTERCEPT_TRANSITION_GRACE_MAX_MS = 1200;
 const CONVERSATION_FETCH_ESTIMATE_DEFAULT_MS = 320;
 const CONVERSATION_FETCH_HEDGE_MIN_DELAY_MS = 70;
 const CONVERSATION_FETCH_HEDGE_MAX_DELAY_MS = 140;
+const CONVERSATION_FETCH_TIMEOUT_MS = 4_500;
+const CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS = 3_500;
+const CONVERSATION_FETCH_HISTORY_TIMEOUT_MS = 5_000;
+const CONVERSATION_FETCH_MAX_ATTEMPTS = 1;
 const MAX_CONVERSATION_FETCH_INFLIGHT = 2;
 const CONVERSATION_STARTUP_STALE_RECORD_IGNORE_MS = 45_000;
 const SPEAKER_INTERRUPT_BURST_VERIFY_DELAYS_MS = [0, 40, 80, 140, 220];
+const CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_MIN_WAIT_MS = 260;
+const CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_MAX_WAIT_MS = 900;
 const CONVERSATION_INTERCEPT_CALIBRATION_QUERIES = [
     "现在几点",
     "今天星期几",
@@ -4752,7 +4764,11 @@ class XiaoaiCloudPlugin {
             const response = await this.minaClient.fetchConversation(
                 this.device.hardware,
                 this.device.minaDeviceId,
-                clamp(Math.round(limit || 20), 1, CONSOLE_FETCH_LIMIT)
+                clamp(Math.round(limit || 20), 1, CONSOLE_FETCH_LIMIT),
+                {
+                    timeoutMs: CONVERSATION_FETCH_HISTORY_TIMEOUT_MS,
+                    maxAttempts: CONVERSATION_FETCH_MAX_ATTEMPTS,
+                }
             );
             const rawData = response?.data;
             const payload =
@@ -8847,15 +8863,38 @@ class XiaoaiCloudPlugin {
 
     private async performConversationFetch(
         minaClient: MiNAClient,
-        device: DeviceContext
+        device: DeviceContext,
+        options?: {
+            timeoutMs?: number;
+            maxAttempts?: number;
+        }
     ): Promise<any | null> {
         const startedAtMs = Date.now();
+        const timeoutMs = clamp(
+            Math.round(
+                readNumber(options?.timeoutMs) ||
+                    (this.shouldUseHedgedConversationFetch(device.minaDeviceId)
+                        ? CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS
+                        : CONVERSATION_FETCH_TIMEOUT_MS)
+            ),
+            1_000,
+            CONVERSATION_FETCH_TIMEOUT_MS
+        );
+        const maxAttempts = clamp(
+            Math.round(readNumber(options?.maxAttempts) || CONVERSATION_FETCH_MAX_ATTEMPTS),
+            1,
+            3
+        );
         this.conversationFetchInflightCount += 1;
         try {
             const response = await minaClient.fetchConversation(
                 device.hardware,
                 device.minaDeviceId,
-                3
+                3,
+                {
+                    timeoutMs,
+                    maxAttempts,
+                }
             );
             const rawData = response?.data;
             const payload =
@@ -8929,7 +8968,8 @@ class XiaoaiCloudPlugin {
             this.conversationFetchInflightCount < MAX_CONVERSATION_FETCH_INFLIGHT - 1;
         if (allowHedge) {
             const primaryStartedAtMs = Date.now();
-            const primary = this.performConversationFetch(minaClient, device).then(
+            const primary: Promise<ConversationFetchWinner> =
+                this.performConversationFetch(minaClient, device).then(
                 (record) => ({
                     record,
                     source: "primary" as const,
@@ -8955,7 +8995,26 @@ class XiaoaiCloudPlugin {
                     elapsedMs: Math.max(0, Date.now() - hedgeStartedAtMs),
                 };
             })();
-            const winner = await Promise.race([primary, hedge]);
+            let winner: ConversationFetchWinner;
+            try {
+                winner = await Promise.any([primary, hedge]);
+            } catch (error) {
+                const errors =
+                    error instanceof AggregateError
+                        ? error.errors.map((item) => this.errorMessage(item))
+                        : [this.errorMessage(error)];
+                void this.appendDebugTrace("conversation_fetch_hedged_failed", {
+                    deviceId: device.minaDeviceId,
+                    hedgeDelayMs,
+                    errors,
+                    estimateMs: this.readConversationFetchLatencyEstimate(
+                        device.minaDeviceId
+                    ),
+                });
+                throw error instanceof AggregateError && error.errors[0]
+                    ? error.errors[0]
+                    : error;
+            }
             if (winner.source === "hedge") {
                 void this.appendDebugTrace("conversation_fetch_hedged_won", {
                     deviceId: device.minaDeviceId,
@@ -13689,6 +13748,25 @@ class XiaoaiCloudPlugin {
         await this.sendTransitionPrompt();
     }
 
+    private computeLateRecordFastForwardWaitMs(deviceId?: string) {
+        const speakerProfile = this.readSpeakerAudioLatencyProfile(deviceId);
+        const pauseCommandEstimateMs =
+            readNumber(speakerProfile?.pauseCommandEstimateMs) || 0;
+        const statusProbeEstimateMs =
+            readNumber(speakerProfile?.statusProbeEstimateMs) || 0;
+        return clamp(
+            Math.round(
+                Math.max(
+                    CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_MIN_WAIT_MS,
+                    pauseCommandEstimateMs > 0 ? pauseCommandEstimateMs * 1.15 : 0,
+                    statusProbeEstimateMs > 0 ? statusProbeEstimateMs * 0.22 : 0
+                )
+            ),
+            CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_MIN_WAIT_MS,
+            CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_MAX_WAIT_MS
+        );
+    }
+
     private evaluateLateRecordForwarding(
         deviceId?: string,
         hint?: ConversationInterceptHint,
@@ -13765,8 +13843,8 @@ class XiaoaiCloudPlugin {
             deferUntilSilenced: true,
             reason:
                 strategy === "fallback-only"
-                    ? "当前设备/网络画像通常只能拿到晚记录，本轮会先立即强拦截，确认静音后马上转发 OpenClaw 播报"
-                    : `检测到会话记录已晚到 ${recordAgeMs}ms，本轮会先立即强拦截，确认静音后马上转发 OpenClaw 播报`,
+                    ? "当前设备/网络画像通常只能拿到晚记录，本轮会先立即强拦截，发出打断后马上转发 OpenClaw 播报"
+                    : `检测到会话记录已晚到 ${recordAgeMs}ms，本轮会先立即强拦截，发出打断后马上转发 OpenClaw 播报`,
         };
     }
 
@@ -17705,6 +17783,122 @@ class XiaoaiCloudPlugin {
         };
     }
 
+    private async sendFastSpeakerInterruptCommand(
+        device: DeviceContext,
+        mina: MiNAClient,
+        miio: MiIOClient,
+        reason: string
+    ) {
+        const startedAtMs = Date.now();
+        const commands: Array<{ label: string; promise: Promise<true> }> = [];
+        const addCommand = (label: string, promise: Promise<any>) => {
+            commands.push({
+                label,
+                promise: promise.then((result) => {
+                    const code = readNumber((result as any)?.code);
+                    if (!Number.isFinite(code) || code === 0) {
+                        return true as const;
+                    }
+                    throw new Error(`${label} rejected with code ${code}`);
+                }),
+            });
+        };
+
+        for (const media of SPEAKER_CONTROL_MEDIA_CANDIDATES) {
+            addCommand(
+                `mina.pause:${media}`,
+                mina.playerPause(device.minaDeviceId, { media })
+            );
+            addCommand(
+                `mina.stop:${media}`,
+                mina.playerStop(device.minaDeviceId, { media })
+            );
+        }
+
+        if (device.speakerFeatures.pause) {
+            addCommand(
+                "miio.pause",
+                miio.miotAction(
+                    device.miDid,
+                    device.speakerFeatures.pause.siid,
+                    device.speakerFeatures.pause.aiid,
+                    []
+                )
+            );
+        }
+        if (device.speakerFeatures.stop) {
+            addCommand(
+                "miio.stop",
+                miio.miotAction(
+                    device.miDid,
+                    device.speakerFeatures.stop.siid,
+                    device.speakerFeatures.stop.aiid,
+                    []
+                )
+            );
+        }
+
+        const labeledPromises = commands.map((command) =>
+            command.promise.then(() => command.label)
+        );
+        const traceSettledCommands = (acceptedLabel?: string) => {
+            void Promise.allSettled(labeledPromises)
+                .then((results) =>
+                    this.appendDebugTrace("speaker_fast_interrupt_commands_settled", {
+                        deviceId: device.minaDeviceId,
+                        reason,
+                        acceptedLabel,
+                        acceptedCount: results.filter(
+                            (item) => item.status === "fulfilled"
+                        ).length,
+                        attemptedCount: commands.length,
+                        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                    })
+                )
+                .catch(() => undefined);
+        };
+
+        try {
+            const acceptedLabel = await Promise.any(labeledPromises);
+            const elapsedMs = Math.max(0, Date.now() - startedAtMs);
+            this.updateSpeakerAudioLatencyEstimate(
+                device.minaDeviceId,
+                "pauseCommandEstimateMs",
+                elapsedMs
+            );
+            traceSettledCommands(acceptedLabel);
+            void this.finalizeSpeakerStopSuccess(mina, device.minaDeviceId, {
+                preserveLoopGuard: false,
+            }).catch(() => undefined);
+            await this.appendDebugTrace("speaker_fast_interrupt_command_accepted", {
+                deviceId: device.minaDeviceId,
+                reason,
+                acceptedLabel,
+                attemptedCount: commands.length,
+                elapsedMs,
+            });
+            return {
+                accepted: true,
+                acceptedLabel,
+                elapsedMs,
+            };
+        } catch (error) {
+            traceSettledCommands();
+            await this.appendDebugTrace("speaker_fast_interrupt_command_failed", {
+                deviceId: device.minaDeviceId,
+                reason,
+                attemptedCount: commands.length,
+                elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                errorMessage: this.errorMessage(error),
+            });
+            return {
+                accepted: false,
+                acceptedLabel: undefined,
+                elapsedMs: Math.max(0, Date.now() - startedAtMs),
+            };
+        }
+    }
+
     private async stopSpeaker(options?: {
         preserveLoopGuard?: boolean;
         fast?: boolean;
@@ -19148,6 +19342,13 @@ class XiaoaiCloudPlugin {
         };
         const actionContextPromise =
             shouldRunFallbackPauseGuard ? this.ensureActionContext() : undefined;
+        const shouldFastForwardLateRecord = Boolean(
+            interceptHint?.answersPresent &&
+                lateRecordForwarding.deferUntilSilenced === true
+        );
+        if (shouldFastForwardLateRecord) {
+            supplementalGuardState.lastAttemptAtMs = Date.now();
+        }
 
         const silenceTask = (async () => {
             const waitMs =
@@ -19157,6 +19358,21 @@ class XiaoaiCloudPlugin {
             }
             if (!this.waitingForResponse) {
                 return false;
+            }
+            if (interceptHint?.answersPresent) {
+                const { device, mina, miio } = actionContextPromise
+                    ? await actionContextPromise
+                    : await this.ensureActionContext();
+                const interrupt = await this.sendFastSpeakerInterruptCommand(
+                    device,
+                    mina,
+                    miio,
+                    "conversation-late-record-primary"
+                );
+                if (interrupt.accepted) {
+                    supplementalGuardState.lastAttemptAtMs = Date.now();
+                }
+                return interrupt.accepted;
             }
             return this.silenceSpeaker({
                 aggressive: guardPlan.silenceMode === "fast-stop",
@@ -19272,9 +19488,33 @@ class XiaoaiCloudPlugin {
             : Promise.resolve(false);
         if (!interceptHint?.answersPresent) {
             issueForwardOnce("immediate");
+        } else if (shouldFastForwardLateRecord) {
+            const fastForwardWaitMs = this.computeLateRecordFastForwardWaitMs(deviceId);
+            const fastInterruptResult = await Promise.race([
+                silenceTask.then((accepted) => ({
+                    completed: true,
+                    accepted,
+                })),
+                sleep(fastForwardWaitMs).then(() => ({
+                    completed: false,
+                    accepted: false,
+                })),
+            ]);
+            void this.appendDebugTrace("conversation_intercept_fast_forward_gate", {
+                deviceId,
+                fastForwardWaitMs,
+                completed: fastInterruptResult.completed,
+                accepted: fastInterruptResult.accepted,
+                recordAgeMs: readNumber(interceptHint?.recordAgeMs) || undefined,
+            }).catch(() => undefined);
+            issueForwardOnce(
+                fastInterruptResult.completed
+                    ? "late_record_fast_interrupt_forward"
+                    : "late_record_fast_interrupt_timeout_forward"
+            );
         }
-        await silenceTask;
         if (!forwardIssued) {
+            await silenceTask;
             issueForwardOnce(
                 interceptHint?.answersPresent
                     ? lateRecordForwarding.deferUntilSilenced

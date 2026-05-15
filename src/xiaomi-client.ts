@@ -3211,7 +3211,12 @@ export class MiNAClient {
         );
     }
 
-    async fetchConversation(hardware: string, deviceId: string, limit = 3): Promise<any> {
+    async fetchConversation(
+        hardware: string,
+        deviceId: string,
+        limit = 3,
+        options?: { timeoutMs?: number; maxAttempts?: number }
+    ): Promise<any> {
         return this.account.miRequest({
             sid: "micoapi",
             url: MINA_CONVERSATION_URL,
@@ -3224,7 +3229,9 @@ export class MiNAClient {
             },
             cookies: {
                 deviceId
-            }
+            },
+            timeoutMs: options?.timeoutMs,
+            maxAttempts: options?.maxAttempts,
         });
     }
 }
